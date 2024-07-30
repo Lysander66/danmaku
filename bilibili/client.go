@@ -148,7 +148,12 @@ func (e *EventHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 }
 
 const (
-	CMD_DANMU_MSG = "DANMU_MSG"
+	CMD_DANMU_MSG                     = "DANMU_MSG"
+	CMD_LIKE_INFO_V3_CLICK            = "LIKE_INFO_V3_CLICK"
+	CMD_LIKE_INFO_V3_UPDATE           = "LIKE_INFO_V3_UPDATE"
+	CMD_ROOM_REAL_TIME_MESSAGE_UPDATE = "ROOM_REAL_TIME_MESSAGE_UPDATE"
+	CMD_SEND_GIFT                     = "SEND_GIFT"
+	CMD_WATCHED_CHANGE                = "WATCHED_CHANGE"
 )
 
 // body的内容一般是json格式，里面一条广播消息称为cmd
@@ -167,7 +172,23 @@ func parseCmd(body []byte) {
 			}
 			slog.Info("弹幕", "ID", userId, "name", userName, "content", content)
 		}
+	case CMD_LIKE_INFO_V3_CLICK:
+		count := gjson.GetBytes(body, "data.click_count").Int()
+		slog.Debug("点赞数", "count", count)
+	case CMD_LIKE_INFO_V3_UPDATE:
+		text := gjson.GetBytes(body, "data.uname").String() + gjson.GetBytes(body, "data.like_text").String()
+		slog.Debug(text)
+	case CMD_ROOM_REAL_TIME_MESSAGE_UPDATE:
+		count := gjson.GetBytes(body, "data.fans").Int()
+		slog.Debug("fans", "fans", count)
+	case CMD_WATCHED_CHANGE:
+		text := gjson.GetBytes(body, "data.text_large").String()
+		slog.Debug(text)
+	case CMD_SEND_GIFT:
+		data := gjson.GetBytes(body, "data")
+		text := data.Get("uname").String() + " " + data.Get("action").String() + " " + data.Get("giftName").String()
+		slog.Info(text)
 	default:
-		slog.Debug("其它", "CMD", cmd)
+		slog.Info("其它", "CMD", cmd)
 	}
 }
