@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Lysander66/danmaku/pkg/message"
+	"github.com/Lysander66/zephyr/pkg/protocol"
 	"github.com/lxzan/gws"
 )
 
@@ -16,13 +18,6 @@ const (
 	WS_SECRET   = "your-secret-2025"
 	SERVER_PORT = ":8080"
 )
-
-type Message struct {
-	Type     string `json:"type"`
-	ClientID string `json:"client_id"`
-	Content  any    `json:"content"`
-	Target   string `json:"target,omitempty"`
-}
 
 type ClientInfo struct {
 	ID       string `json:"id"`
@@ -93,10 +88,8 @@ func main() {
 		if secret != WS_SECRET {
 			slog.Warn("❌ 认证失败", "reason", "secret不匹配")
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]any{
-				"error": "需要认证",
-				"code":  401,
-			})
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"error":"需要认证","code":401}`))
 			return
 		}
 		slog.Debug("✅ 认证成功")
@@ -108,17 +101,24 @@ func main() {
 		}
 		handler.clientsLock.RUnlock()
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
+		response := map[string]any{
 			"clients": clientList,
 			"count":   len(clientList),
-		})
+		}
+
+		responseJSON, err := json.Marshal(response)
+		if err != nil {
+			slog.Error("❌ 序列化客户端列表失败", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(responseJSON)
 	})
 
 	slog.Info("🚀 WebSocket 服务器启动", "port", SERVER_PORT)
-	slog.Info("🔐 WebSocket密钥", "secret", WS_SECRET)
 	slog.Info("🌐 管理界面", "url", "http://localhost"+SERVER_PORT)
-	slog.Info("📡 WebSocket", "url", "ws://localhost"+SERVER_PORT+"/ws?secret="+WS_SECRET)
 
 	if err := http.ListenAndServe(SERVER_PORT, nil); err != nil {
 		slog.Error("服务器启动失败", "error", err)
@@ -155,14 +155,16 @@ func (h *WebSocketHandler) OnClose(socket *gws.Conn, err error) {
 		slog.Info("🔌 客户端断开", "id", client.ID, "ip", client.IP)
 
 		// 广播客户端下线消息
-		h.broadcast(Message{
-			Type:     "client_offline",
-			ClientID: client.ID,
-			Content: map[string]any{
-				"message": "客户端 " + client.ID + " 已下线",
-				"ip":      client.IP,
+		offlineMsg := &message.ClientOfflineMessage{
+			BaseMessage: message.BaseMessage{
+				ClientID: client.ID,
+				Content: map[string]any{
+					"message": "客户端 " + client.ID + " 已下线",
+					"ip":      client.IP,
+				},
 			},
-		})
+		}
+		h.broadcastMessage(offlineMsg, message.OP_CLIENT_OFFLINE, 1)
 	}
 }
 
@@ -191,12 +193,18 @@ func (h *WebSocketHandler) OnPong(socket *gws.Conn, payload []byte) {
 func (h *WebSocketHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 
-	var msg Message
-	if err := json.Unmarshal(message.Bytes(), &msg); err != nil {
+	// 解析协议
+	pkt, err := protocol.Unpack(message.Bytes())
+	if err != nil {
 		slog.Error("❌ 解析消息失败", "error", err)
 		return
 	}
 
+	h.handleMessage(socket, pkt)
+}
+
+// handleMessage 处理协议消息
+func (h *WebSocketHandler) handleMessage(socket *gws.Conn, pkt *protocol.Packet) {
 	h.clientsLock.RLock()
 	client, exists := h.clients[socket]
 	h.clientsLock.RUnlock()
@@ -205,159 +213,29 @@ func (h *WebSocketHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 		return
 	}
 
-	switch msg.Type {
-	case "register":
-		h.handleRegister(socket, msg, client)
-	case "broadcast":
-		h.handleBroadcast(socket, msg, client)
-	case "private":
-		h.handlePrivate(socket, msg, client)
+	// 创建对应的消息对象
+	msg := message.NewMessage(pkt.Header.Operation)
+	if msg == nil {
+		slog.Error("❌ 未知的操作类型", "operation", pkt.Header.Operation)
+		return
+	}
+
+	// 解析消息体
+	if err := msg.Unmarshal(pkt.Payload); err != nil {
+		slog.Error("❌ 解析消息体失败", "error", err)
+		return
+	}
+
+	// 根据操作类型处理消息
+	switch pkt.Header.Operation {
+	case message.OP_REGISTER:
+		h.handleRegister(socket, msg, client, pkt.Header.SequenceID)
+	case message.OP_BROADCAST:
+		h.handleBroadcast(socket, msg, client, pkt.Header.SequenceID)
+	case message.OP_PRIVATE:
+		h.handlePrivate(socket, msg, client, pkt.Header.SequenceID)
 	default:
-		slog.Info("🔍 未知消息类型", "type", msg.Type)
-	}
-}
-
-// 处理注册
-func (h *WebSocketHandler) handleRegister(socket *gws.Conn, message Message, client *ClientInfo) {
-	clientID := message.ClientID
-	if clientID == "" {
-		h.clientIDLock.Lock()
-		clientID = "client_" + strconv.Itoa(h.clientIDCounter)
-		h.clientIDCounter++
-		h.clientIDLock.Unlock()
-	}
-
-	h.clientsLock.Lock()
-	client.ID = clientID
-	h.clientsLock.Unlock()
-
-	slog.Info("📝 客户端注册", "id", clientID, "ip", client.IP)
-
-	// 发送注册成功消息
-	response := Message{
-		Type:     "register_success",
-		ClientID: clientID,
-		Content: map[string]any{
-			"message": "注册成功",
-			"ip":      client.IP,
-		},
-	}
-
-	if data, err := json.Marshal(response); err == nil {
-		_ = socket.WriteMessage(gws.OpcodeText, data)
-	}
-
-	// 广播新客户端上线
-	h.broadcast(Message{
-		Type:     "client_online",
-		ClientID: clientID,
-		Content: map[string]any{
-			"message": "客户端 " + clientID + " 已上线",
-			"ip":      client.IP,
-		},
-	})
-
-	// 发送当前客户端列表
-	h.sendClientList(socket)
-}
-
-// 处理广播消息
-func (h *WebSocketHandler) handleBroadcast(socket *gws.Conn, message Message, client *ClientInfo) {
-	slog.Info("📻 广播消息", "id", client.ID, "ip", client.IP, "content", message.Content)
-
-	broadcastMsg := Message{
-		Type:     "broadcast",
-		ClientID: client.ID,
-		Content: map[string]any{
-			"message": message.Content,
-			"ip":      client.IP,
-		},
-	}
-
-	h.broadcast(broadcastMsg)
-}
-
-// 处理私聊消息
-func (h *WebSocketHandler) handlePrivate(socket *gws.Conn, message Message, client *ClientInfo) {
-	targetID := message.Target
-	if targetID == "" {
-		return
-	}
-
-	slog.Info("💬 私聊消息", "from", client.ID, "to", targetID, "content", message.Content)
-
-	// 查找目标客户端
-	h.clientsLock.RLock()
-	var targetSession *gws.Conn
-	for session, c := range h.clients {
-		if c.ID == targetID {
-			targetSession = session
-			break
-		}
-	}
-	h.clientsLock.RUnlock()
-
-	privateMsg := Message{
-		Type:     "private",
-		ClientID: client.ID,
-		Content: map[string]any{
-			"message": message.Content,
-			"ip":      client.IP,
-		},
-	}
-
-	if targetSession != nil {
-		if data, err := json.Marshal(privateMsg); err == nil {
-			_ = targetSession.WriteMessage(gws.OpcodeText, data)
-		}
-	} else {
-		// 目标不存在，发送错误消息
-		errorMsg := Message{
-			Type:    "error",
-			Content: "目标客户端 " + targetID + " 不存在或未在线",
-		}
-		if data, err := json.Marshal(errorMsg); err == nil {
-			_ = socket.WriteMessage(gws.OpcodeText, data)
-		}
-	}
-}
-
-// 广播消息给所有客户端
-func (h *WebSocketHandler) broadcast(message Message) {
-	data, err := json.Marshal(message)
-	if err != nil {
-		return
-	}
-
-	// 先复制客户端列表，避免长时间持有锁
-	h.clientsLock.RLock()
-	sessions := make([]*gws.Conn, 0, len(h.clients))
-	for session := range h.clients {
-		sessions = append(sessions, session)
-	}
-	h.clientsLock.RUnlock()
-
-	for _, session := range sessions {
-		_ = session.WriteMessage(gws.OpcodeText, data)
-	}
-}
-
-// 发送客户端列表
-func (h *WebSocketHandler) sendClientList(socket *gws.Conn) {
-	h.clientsLock.RLock()
-	var clientList []ClientInfo
-	for _, client := range h.clients {
-		clientList = append(clientList, *client)
-	}
-	h.clientsLock.RUnlock()
-
-	listMsg := Message{
-		Type:    "client_list",
-		Content: clientList,
-	}
-
-	if data, err := json.Marshal(listMsg); err == nil {
-		_ = socket.WriteMessage(gws.OpcodeText, data)
+		slog.Info("🔍 未知的操作类型", "operation", pkt.Header.Operation)
 	}
 }
 
@@ -393,4 +271,204 @@ func getClientIP(r *http.Request) string {
 		return ip
 	}
 	return r.RemoteAddr
+}
+
+// handleRegister 处理注册消息
+func (h *WebSocketHandler) handleRegister(socket *gws.Conn, msg message.Message, client *ClientInfo, sequenceID uint32) {
+	registerMsg, ok := msg.(*message.RegisterMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "RegisterMessage")
+		return
+	}
+
+	clientID := registerMsg.ClientID
+	if clientID == "" {
+		h.clientIDLock.Lock()
+		clientID = "client_" + strconv.Itoa(h.clientIDCounter)
+		h.clientIDCounter++
+		h.clientIDLock.Unlock()
+	}
+
+	h.clientsLock.Lock()
+	client.ID = clientID
+	h.clientsLock.Unlock()
+
+	slog.Info("📝 客户端注册", "id", clientID, "ip", client.IP)
+
+	// 确保客户端信息已更新到map中
+	h.clientsLock.Lock()
+	if existingClient, exists := h.clients[socket]; exists {
+		existingClient.ID = clientID
+	}
+	h.clientsLock.Unlock()
+
+	// 发送注册成功消息
+	response := &message.RegisterReplyMessage{
+		BaseMessage: message.BaseMessage{
+			ClientID: clientID,
+			Content: map[string]any{
+				"message": "注册成功",
+				"ip":      client.IP,
+			},
+		},
+		Success: true,
+		Message: "注册成功",
+	}
+
+	h.sendMessage(socket, response, message.OP_REGISTER_REPLY, sequenceID)
+
+	// 广播新客户端上线
+	onlineMsg := &message.ClientOnlineMessage{
+		BaseMessage: message.BaseMessage{
+			ClientID: clientID,
+			Content: map[string]any{
+				"message": "客户端 " + clientID + " 已上线",
+				"ip":      client.IP,
+			},
+		},
+	}
+
+	h.broadcastMessage(onlineMsg, message.OP_CLIENT_ONLINE, sequenceID)
+
+	// 发送当前客户端列表
+	h.sendClientList(socket, sequenceID)
+}
+
+// handleBroadcast 处理广播消息
+func (h *WebSocketHandler) handleBroadcast(socket *gws.Conn, msg message.Message, client *ClientInfo, sequenceID uint32) {
+	broadcastMsg, ok := msg.(*message.BroadcastMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "BroadcastMessage")
+		return
+	}
+
+	slog.Info("📻 广播消息", "id", client.ID, "ip", client.IP, "content", broadcastMsg.Content)
+
+	// 构造广播消息
+	response := &message.BroadcastMessage{
+		BaseMessage: message.BaseMessage{
+			ClientID: client.ID,
+			Content: map[string]any{
+				"message": broadcastMsg.Content,
+				"ip":      client.IP,
+			},
+		},
+	}
+
+	h.broadcastMessage(response, message.OP_BROADCAST, sequenceID)
+}
+
+// handlePrivate 处理私聊消息
+func (h *WebSocketHandler) handlePrivate(socket *gws.Conn, msg message.Message, client *ClientInfo, sequenceID uint32) {
+	privateMsg, ok := msg.(*message.PrivateMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "PrivateMessage")
+		return
+	}
+
+	targetID := privateMsg.Target
+	if targetID == "" {
+		return
+	}
+
+	slog.Info("💬 私聊消息", "from", client.ID, "to", targetID, "content", privateMsg.Content)
+
+	// 查找目标客户端
+	h.clientsLock.RLock()
+	var targetSession *gws.Conn
+	for session, c := range h.clients {
+		if c.ID == targetID {
+			targetSession = session
+			break
+		}
+	}
+	h.clientsLock.RUnlock()
+
+	response := &message.PrivateMessage{
+		BaseMessage: message.BaseMessage{
+			ClientID: client.ID,
+			Content: map[string]any{
+				"message": privateMsg.Content,
+				"ip":      client.IP,
+			},
+		},
+	}
+
+	if targetSession != nil {
+		h.sendMessage(targetSession, response, message.OP_PRIVATE, sequenceID)
+	} else {
+		// 目标不存在，发送错误消息
+		errorMsg := &message.ErrorMessage{
+			BaseMessage: message.BaseMessage{},
+			Error:       "目标客户端 " + targetID + " 不存在或未在线",
+		}
+		h.sendMessage(socket, errorMsg, message.OP_ERROR, sequenceID)
+	}
+}
+
+// sendMessage 发送消息
+func (h *WebSocketHandler) sendMessage(socket *gws.Conn, msg message.Message, operation uint16, sequenceID uint32) {
+	body, err := msg.Marshal()
+	if err != nil {
+		slog.Error("❌ 序列化消息失败", "error", err)
+		return
+	}
+
+	pkt := protocol.NewPacket(operation, body, protocol.WithSequenceID(sequenceID))
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		slog.Error("❌ 打包消息失败", "error", err)
+		return
+	}
+
+	_ = socket.WriteMessage(gws.OpcodeBinary, data)
+}
+
+// broadcastMessage 广播消息
+func (h *WebSocketHandler) broadcastMessage(msg message.Message, operation uint16, sequenceID uint32) {
+	body, err := msg.Marshal()
+	if err != nil {
+		slog.Error("❌ 序列化广播消息失败", "error", err)
+		return
+	}
+
+	pkt := protocol.NewPacket(operation, body, protocol.WithSequenceID(sequenceID))
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		slog.Error("❌ 打包广播消息失败", "error", err)
+		return
+	}
+
+	// 先复制客户端列表，避免长时间持有锁
+	h.clientsLock.RLock()
+	sessions := make([]*gws.Conn, 0, len(h.clients))
+	for session := range h.clients {
+		sessions = append(sessions, session)
+	}
+	h.clientsLock.RUnlock()
+
+	for _, session := range sessions {
+		_ = session.WriteMessage(gws.OpcodeBinary, data)
+	}
+}
+
+// sendClientList 发送客户端列表
+func (h *WebSocketHandler) sendClientList(socket *gws.Conn, sequenceID uint32) {
+	h.clientsLock.RLock()
+	var clientList []message.ClientInfo
+	for _, client := range h.clients {
+		clientList = append(clientList, message.ClientInfo{
+			ID:       client.ID,
+			IP:       client.IP,
+			JoinTime: client.JoinTime,
+		})
+	}
+	h.clientsLock.RUnlock()
+
+	listMsg := &message.ClientListMessage{
+		BaseMessage: message.BaseMessage{},
+		Clients:     clientList,
+	}
+
+	h.sendMessage(socket, listMsg, message.OP_CLIENT_LIST, sequenceID)
 }

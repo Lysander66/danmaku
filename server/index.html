@@ -643,6 +643,89 @@
       let messageCount = 0;
       let startTime = new Date();
 
+      // 消息类型
+      const OP_REGISTER = 100;
+      const OP_REGISTER_REPLY = 101;
+      const OP_BROADCAST = 102;
+      const OP_PRIVATE = 103;
+      const OP_CLIENT_LIST = 104;
+      const OP_CLIENT_ONLINE = 105;
+      const OP_CLIENT_OFFLINE = 106;
+      const OP_ERROR = 107;
+
+      // 编码
+      function encodePacket(operation, payload) {
+        const header = new ArrayBuffer(8);
+        const view = new DataView(header);
+
+        // Version (2 bytes) - 固定为1
+        view.setUint16(0, 1, false); // big-endian
+        // Operation (2 bytes)
+        view.setUint16(2, operation, false);
+        // SequenceID (4 bytes) - 使用时间戳
+        view.setUint32(4, Date.now(), false);
+
+        // 转换为 Uint8Array
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
+
+        // 创建完整的数据包
+        const packet = new Uint8Array(8 + payloadBytes.length);
+        packet.set(new Uint8Array(header), 0);
+        packet.set(payloadBytes, 8);
+
+        return packet;
+      }
+
+      // 解码
+      function decodePacketFromArrayBuffer(arrayBuffer) {
+        try {
+          const view = new DataView(arrayBuffer);
+
+          // 解析头部
+          const version = view.getUint16(0, false);
+          const operation = view.getUint16(2, false);
+          const sequenceID = view.getUint32(4, false);
+
+          // 解析payload
+          const payloadBytes = new Uint8Array(arrayBuffer, 8);
+          const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+
+          return {
+            header: { version, operation, sequenceID },
+            payload,
+          };
+        } catch (e) {
+          console.error("解析ArrayBuffer数据包失败:", e);
+          return null;
+        }
+      }
+
+      function decodePacket(data) {
+        try {
+          if (data instanceof Blob) {
+            // 转换为 ArrayBuffer
+            const reader = new FileReader();
+            reader.onload = function (e) {
+              const result = e.target.result;
+              if (result instanceof ArrayBuffer) {
+                const packet = decodePacketFromArrayBuffer(result);
+                if (packet) {
+                  handleBinaryMessage(packet);
+                }
+              }
+            };
+            reader.readAsArrayBuffer(data);
+            return null;
+          } else {
+            console.error("不支持的数据类型:", typeof data, data);
+            return null;
+          }
+        } catch (e) {
+          console.error("解析数据包失败:", e);
+          return null;
+        }
+      }
+
       // 初始化
       function init() {
         document.getElementById("startTime").textContent = formatTime(
@@ -670,20 +753,20 @@
             '<i class="fas fa-check-circle"></i><span>已连接</span>';
 
           // 注册
-          ws.send(
-            JSON.stringify({
-              type: "register",
-              client_id: clientID,
-            })
-          );
+          const registerPacket = encodePacket(OP_REGISTER, {
+            client_id: clientID,
+          });
+          ws.send(registerPacket);
 
           showNotification("WebSocket 连接成功", "success");
         };
 
         ws.onmessage = function (event) {
           try {
-            const message = JSON.parse(event.data);
-            handleMessage(message);
+            const packet = decodePacket(event.data);
+            if (packet) {
+              handleBinaryMessage(packet);
+            }
           } catch (e) {
             console.error("解析消息失败:", e);
           }
@@ -707,6 +790,38 @@
           statusElement.innerHTML =
             '<i class="fas fa-exclamation-triangle"></i><span>连接错误</span>';
         };
+      }
+
+      function handleBinaryMessage(packet) {
+        messageCount++;
+        document.getElementById("messageCount").textContent = messageCount;
+
+        const { header, payload } = packet;
+
+        switch (header.operation) {
+          case OP_REGISTER_REPLY:
+            console.log("注册成功:", payload);
+            break;
+          case OP_CLIENT_LIST:
+            updateClientList(payload.Clients || payload.clients || []);
+            break;
+          case OP_CLIENT_ONLINE:
+            payload.type = "client_online";
+            addMessageLog(payload);
+            break;
+          case OP_CLIENT_OFFLINE:
+            payload.type = "client_offline";
+            addMessageLog(payload);
+            break;
+          case OP_BROADCAST:
+            payload.type = "broadcast";
+            addMessageLog(payload);
+            break;
+          case OP_PRIVATE:
+            payload.type = "private";
+            addMessageLog(payload);
+            break;
+        }
       }
 
       function handleMessage(message) {
@@ -847,13 +962,11 @@
         const content = input.value.trim();
 
         if (content && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "broadcast",
-              client_id: clientID,
-              content: content,
-            })
-          );
+          const broadcastPacket = encodePacket(OP_BROADCAST, {
+            client_id: clientID,
+            content: content,
+          });
+          ws.send(broadcastPacket);
           input.value = "";
           showNotification("广播消息已发送", "success");
         } else if (!content) {
@@ -870,14 +983,12 @@
         const content = messageInput.value.trim();
 
         if (target && content && ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: "private",
-              client_id: clientID,
-              target: target,
-              content: content,
-            })
-          );
+          const privatePacket = encodePacket(OP_PRIVATE, {
+            client_id: clientID,
+            target: target,
+            content: content,
+          });
+          ws.send(privatePacket);
           messageInput.value = "";
           showNotification(`私聊消息已发送给 ${target}`, "success");
         } else if (!target) {

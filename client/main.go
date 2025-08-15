@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -10,15 +9,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Lysander66/danmaku/pkg/message"
+	"github.com/Lysander66/zephyr/pkg/protocol"
 	"github.com/lxzan/gws"
 )
-
-type Message struct {
-	Type     string `json:"type"`
-	ClientID string `json:"client_id"`
-	Content  any    `json:"content"`
-	Target   string `json:"target,omitempty"`
-}
 
 type ClientConfig struct {
 	ServerURL      string
@@ -28,13 +22,20 @@ type ClientConfig struct {
 	PongWait       time.Duration
 }
 
+// ClientMessage 客户端内部消息结构
+type ClientMessage struct {
+	Type    string
+	Content any
+	Target  string
+}
+
 type Client struct {
 	config         *ClientConfig
 	conn           *gws.Conn
 	isConnected    bool
 	reconnectCount int
 	stopChan       chan struct{}
-	messageChan    chan Message
+	messageChan    chan ClientMessage
 }
 
 type WebSocketClient struct {
@@ -81,7 +82,7 @@ func NewClient(config *ClientConfig) *Client {
 	return &Client{
 		config:      config,
 		stopChan:    make(chan struct{}),
-		messageChan: make(chan Message, 100),
+		messageChan: make(chan ClientMessage, 100),
 	}
 }
 
@@ -148,14 +149,27 @@ func (c *Client) register() {
 
 	slog.Info("📝 正在注册客户端...")
 
-	registerMsg := Message{
-		Type:     "register",
-		ClientID: c.config.ClientID,
+	// 使用协议注册
+	registerMsg := &message.RegisterMessage{
+		BaseMessage: message.BaseMessage{
+			ClientID: c.config.ClientID,
+		},
 	}
 
-	if data, err := json.Marshal(registerMsg); err == nil {
-		_ = c.conn.WriteMessage(gws.OpcodeText, data)
+	body, err := registerMsg.Marshal()
+	if err != nil {
+		slog.Error("❌ 序列化注册消息失败", "error", err)
+		return
 	}
+
+	pkt := protocol.NewPacket(message.OP_REGISTER, body)
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		slog.Error("❌ 打包注册消息失败", "error", err)
+		return
+	}
+
+	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
 }
 
 func (c *Client) writeMessages() {
@@ -164,8 +178,12 @@ func (c *Client) writeMessages() {
 		case message := <-c.messageChan:
 			// 检查连接状态
 			if c.conn != nil && c.isConnected {
-				if data, err := json.Marshal(message); err == nil {
-					_ = c.conn.WriteMessage(gws.OpcodeText, data)
+				// 根据消息类型选择协议
+				switch message.Type {
+				case "broadcast":
+					c.sendBroadcast(message.Content)
+				case "private":
+					c.sendPrivate(message.Target, message.Content)
 				}
 			}
 
@@ -178,65 +196,147 @@ func (c *Client) writeMessages() {
 	}
 }
 
-func (c *Client) handleMessage(message Message) {
-	switch message.Type {
-	case "register_success":
-		if content, ok := message.Content.(map[string]any); ok {
-			if ip, exists := content["ip"]; exists {
-				slog.Info("🎉 注册成功", "id", message.ClientID, "ip", ip)
-			} else {
-				slog.Info("🎉 注册成功", "id", message.ClientID)
-			}
-			c.config.ClientID = message.ClientID
-		}
-
-	case "client_online":
-		if content, ok := message.Content.(map[string]any); ok {
-			if msg, exists := content["message"]; exists {
-				slog.Info("📢 客户端上线", "message", msg)
-			}
-		}
-
-	case "client_offline":
-		if content, ok := message.Content.(map[string]any); ok {
-			if msg, exists := content["message"]; exists {
-				slog.Info("📢 客户端下线", "message", msg)
-			}
-		}
-
-	case "broadcast":
-		if content, ok := message.Content.(map[string]any); ok {
-			msg := content["message"]
-			ip := content["ip"]
-			slog.Info("📻 广播消息", "id", message.ClientID, "ip", ip, "message", msg)
-		}
-
-	case "private":
-		if content, ok := message.Content.(map[string]any); ok {
-			msg := content["message"]
-			ip := content["ip"]
-			slog.Info("💬 私聊消息", "id", message.ClientID, "ip", ip, "message", msg)
-		}
-
-	case "client_list":
-		slog.Info("👥 当前在线客户端")
-		if clients, ok := message.Content.([]any); ok {
-			for _, client := range clients {
-				if clientMap, ok := client.(map[string]any); ok {
-					id := clientMap["id"]
-					ip := clientMap["ip"]
-					joinTime := clientMap["join_time"]
-					slog.Info("   - 客户端信息", "id", id, "ip", ip, "joinTime", joinTime)
-				}
-			}
-		}
-
-	case "error":
-		slog.Error("❌ 错误", "content", message.Content)
-
-	default:
-		slog.Info("🔍 未知消息类型", "type", message.Type, "content", message.Content)
+// handleMessage 处理协议消息
+func (c *Client) handleMessage(pkt *protocol.Packet) {
+	// 创建对应的消息对象
+	msg := message.NewMessage(pkt.Header.Operation)
+	if msg == nil {
+		slog.Error("❌ 未知的操作类型", "operation", pkt.Header.Operation)
+		return
 	}
+
+	// 解析消息体
+	if err := msg.Unmarshal(pkt.Payload); err != nil {
+		slog.Error("❌ 解析消息体失败", "error", err)
+		return
+	}
+
+	// 根据操作类型处理消息
+	switch pkt.Header.Operation {
+	case message.OP_REGISTER_REPLY:
+		c.handleRegisterReply(msg)
+	case message.OP_BROADCAST:
+		c.handleBroadcastMsg(msg)
+	case message.OP_PRIVATE:
+		c.handlePrivateMsg(msg)
+	case message.OP_CLIENT_LIST:
+		c.handleClientList(msg)
+	case message.OP_CLIENT_ONLINE:
+		c.handleClientOnline(msg)
+	case message.OP_CLIENT_OFFLINE:
+		c.handleClientOffline(msg)
+	case message.OP_ERROR:
+		c.handleError(msg)
+	default:
+		slog.Info("🔍 未知的操作类型", "operation", pkt.Header.Operation)
+	}
+}
+
+// handleRegisterReply 处理注册回复
+func (c *Client) handleRegisterReply(msg message.Message) {
+	registerReply, ok := msg.(*message.RegisterReplyMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "RegisterReplyMessage")
+		return
+	}
+
+	if registerReply.Success {
+		if content, ok := registerReply.Content.(map[string]any); ok {
+			if ip, exists := content["ip"]; exists {
+				slog.Info("🎉 注册成功", "id", registerReply.ClientID, "ip", ip)
+			} else {
+				slog.Info("🎉 注册成功", "id", registerReply.ClientID)
+			}
+		}
+		c.config.ClientID = registerReply.ClientID
+	} else {
+		slog.Error("❌ 注册失败", "message", registerReply.Message)
+	}
+}
+
+// handleBroadcastMsg 处理广播消息
+func (c *Client) handleBroadcastMsg(msg message.Message) {
+	broadcastMsg, ok := msg.(*message.BroadcastMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "BroadcastMessage")
+		return
+	}
+
+	if content, ok := broadcastMsg.Content.(map[string]any); ok {
+		message := content["message"]
+		ip := content["ip"]
+		slog.Info("📻 广播消息", "id", broadcastMsg.ClientID, "ip", ip, "message", message)
+	}
+}
+
+// handlePrivateMsg 处理私聊消息
+func (c *Client) handlePrivateMsg(msg message.Message) {
+	privateMsg, ok := msg.(*message.PrivateMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "PrivateMessage")
+		return
+	}
+
+	if content, ok := privateMsg.Content.(map[string]any); ok {
+		message := content["message"]
+		ip := content["ip"]
+		slog.Info("💬 私聊消息", "id", privateMsg.ClientID, "ip", ip, "message", message)
+	}
+}
+
+// handleClientList 处理客户端列表
+func (c *Client) handleClientList(msg message.Message) {
+	clientListMsg, ok := msg.(*message.ClientListMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "ClientListMessage")
+		return
+	}
+
+	slog.Info("👥 客户端列表")
+	for _, client := range clientListMsg.Clients {
+		slog.Info("   - 客户端信息", "id", client.ID, "ip", client.IP, "joinTime", client.JoinTime)
+	}
+}
+
+// handleClientOnline 处理客户端上线
+func (c *Client) handleClientOnline(msg message.Message) {
+	onlineMsg, ok := msg.(*message.ClientOnlineMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "ClientOnlineMessage")
+		return
+	}
+
+	if content, ok := onlineMsg.Content.(map[string]any); ok {
+		if message, exists := content["message"]; exists {
+			slog.Info("📢 客户端上线", "message", message)
+		}
+	}
+}
+
+// handleClientOffline 处理客户端下线
+func (c *Client) handleClientOffline(msg message.Message) {
+	offlineMsg, ok := msg.(*message.ClientOfflineMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "ClientOfflineMessage")
+		return
+	}
+
+	if content, ok := offlineMsg.Content.(map[string]any); ok {
+		if message, exists := content["message"]; exists {
+			slog.Info("📢 客户端下线", "message", message)
+		}
+	}
+}
+
+// handleError 处理错误消息
+func (c *Client) handleError(msg message.Message) {
+	errorMsg, ok := msg.(*message.ErrorMessage)
+	if !ok {
+		slog.Error("❌ 消息类型转换失败", "expected", "ErrorMessage")
+		return
+	}
+
+	slog.Error("❌ 错误", "error", errorMsg.Error)
 }
 
 func (c *Client) HandleUserInput() {
@@ -289,41 +389,65 @@ func (c *Client) HandleUserInput() {
 	}
 }
 
-// 发送广播消息
-func (c *Client) sendBroadcast(content string) {
-	if !c.isConnected {
+// sendBroadcast 发送广播消息
+func (c *Client) sendBroadcast(content any) {
+	if c.conn == nil || !c.isConnected {
 		slog.Error("❌ 未连接到服务器")
 		return
 	}
 
-	select {
-	case c.messageChan <- Message{
-		Type:    "broadcast",
-		Content: content,
-	}:
-		slog.Info("📻 广播消息已发送", "content", content)
-	default:
-		slog.Error("❌ 消息队列已满")
+	broadcastMsg := &message.BroadcastMessage{
+		BaseMessage: message.BaseMessage{
+			Content: content,
+		},
 	}
+
+	body, err := broadcastMsg.Marshal()
+	if err != nil {
+		slog.Error("❌ 序列化广播消息失败", "error", err)
+		return
+	}
+
+	pkt := protocol.NewPacket(message.OP_BROADCAST, body)
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		slog.Error("❌ 打包广播消息失败", "error", err)
+		return
+	}
+
+	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
+	slog.Info("📻 广播消息已发送", "content", content)
 }
 
-// 发送私聊消息
-func (c *Client) sendPrivate(target, content string) {
-	if !c.isConnected {
+// sendPrivate 发送私聊消息
+func (c *Client) sendPrivate(target string, content any) {
+	if c.conn == nil || !c.isConnected {
 		slog.Error("❌ 未连接到服务器")
 		return
 	}
 
-	select {
-	case c.messageChan <- Message{
-		Type:    "private",
-		Target:  target,
-		Content: content,
-	}:
-		slog.Info("💬 私聊消息已发送", "target", target, "content", content)
-	default:
-		slog.Error("❌ 消息队列已满")
+	privateMsg := &message.PrivateMessage{
+		BaseMessage: message.BaseMessage{
+			Target:  target,
+			Content: content,
+		},
 	}
+
+	body, err := privateMsg.Marshal()
+	if err != nil {
+		slog.Error("❌ 序列化私聊消息失败", "error", err)
+		return
+	}
+
+	pkt := protocol.NewPacket(message.OP_PRIVATE, body)
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		slog.Error("❌ 打包私聊消息失败", "error", err)
+		return
+	}
+
+	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
+	slog.Info("💬 私聊消息已发送", "target", target, "content", content)
 }
 
 // 显示状态
@@ -422,11 +546,12 @@ func (w *WebSocketClient) OnPong(socket *gws.Conn, payload []byte) {
 func (w *WebSocketClient) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 
-	var msg Message
-	if err := json.Unmarshal(message.Bytes(), &msg); err != nil {
+	// 解析协议
+	pkt, err := protocol.Unpack(message.Bytes())
+	if err != nil {
 		slog.Error("❌ 解析消息失败", "error", err)
 		return
 	}
 
-	w.client.handleMessage(msg)
+	w.client.handleMessage(pkt)
 }
