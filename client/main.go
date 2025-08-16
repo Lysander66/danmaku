@@ -22,20 +22,12 @@ type ClientConfig struct {
 	PongWait       time.Duration
 }
 
-// ClientMessage 客户端内部消息结构
-type ClientMessage struct {
-	Type    string
-	Content any
-	Target  string
-}
-
 type Client struct {
 	config         *ClientConfig
 	conn           *gws.Conn
 	isConnected    bool
 	reconnectCount int
 	stopChan       chan struct{}
-	messageChan    chan ClientMessage
 }
 
 type WebSocketClient struct {
@@ -80,9 +72,8 @@ func main() {
 
 func NewClient(config *ClientConfig) *Client {
 	return &Client{
-		config:      config,
-		stopChan:    make(chan struct{}),
-		messageChan: make(chan ClientMessage, 100),
+		config:   config,
+		stopChan: make(chan struct{}),
 	}
 }
 
@@ -104,9 +95,6 @@ func (c *Client) Start() {
 
 			// 注册客户端
 			c.register()
-
-			// 启动消息处理协程
-			go c.writeMessages()
 
 			// 启动ReadLoop来处理接收到的消息
 			go c.conn.ReadLoop()
@@ -170,30 +158,6 @@ func (c *Client) register() {
 	}
 
 	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
-}
-
-func (c *Client) writeMessages() {
-	for {
-		select {
-		case message := <-c.messageChan:
-			// 检查连接状态
-			if c.conn != nil && c.isConnected {
-				// 根据消息类型选择协议
-				switch message.Type {
-				case "broadcast":
-					c.sendBroadcast(message.Content)
-				case "private":
-					c.sendPrivate(message.Target, message.Content)
-				}
-			}
-
-		case <-c.stopChan:
-			if c.conn != nil {
-				c.conn.WriteClose(1000, []byte("normal closure"))
-			}
-			return
-		}
-	}
 }
 
 // handleMessage 处理协议消息
