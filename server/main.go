@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -164,7 +165,7 @@ func (h *WebSocketHandler) OnClose(socket *gws.Conn, err error) {
 				},
 			},
 		}
-		h.broadcastMessage(offlineMsg, message.OP_CLIENT_OFFLINE, 1)
+		h.broadcastMessage(offlineMsg, message.OP_CLIENT_OFFLINE)
 	}
 }
 
@@ -193,18 +194,11 @@ func (h *WebSocketHandler) OnPong(socket *gws.Conn, payload []byte) {
 func (h *WebSocketHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 
-	// 解析协议
-	pkt, err := protocol.Unpack(message.Bytes())
-	if err != nil {
-		slog.Error("❌ 解析消息失败", "error", err)
-		return
-	}
-
-	h.handleMessage(socket, pkt)
+	h.handleMessage(socket, message.Bytes())
 }
 
 // handleMessage 处理协议消息
-func (h *WebSocketHandler) handleMessage(socket *gws.Conn, pkt *protocol.Packet) {
+func (h *WebSocketHandler) handleMessage(socket *gws.Conn, data []byte) {
 	h.clientsLock.RLock()
 	client, exists := h.clients[socket]
 	h.clientsLock.RUnlock()
@@ -213,20 +207,24 @@ func (h *WebSocketHandler) handleMessage(socket *gws.Conn, pkt *protocol.Packet)
 		return
 	}
 
-	// 创建对应的消息对象
+	pkt, err := protocol.Unpack(data)
+	if err != nil {
+		slog.Error("failed to unpack", "error", err)
+		return
+	}
+
+	// 创建对应的消息
 	msg := message.NewMessage(pkt.Header.Operation)
 	if msg == nil {
-		slog.Error("❌ 未知的操作类型", "operation", pkt.Header.Operation)
+		slog.Error("unknown operation", "operation", pkt.Header.Operation)
 		return
 	}
 
-	// 解析消息体
-	if err := msg.Unmarshal(pkt.Payload); err != nil {
-		slog.Error("❌ 解析消息体失败", "error", err)
+	if err = msg.Unmarshal(pkt.Payload); err != nil {
+		slog.Error("failed to unmarshal", "error", err)
 		return
 	}
 
-	// 根据操作类型处理消息
 	switch pkt.Header.Operation {
 	case message.OP_REGISTER:
 		h.handleRegister(socket, msg, client, pkt.Header.SequenceID)
@@ -235,7 +233,7 @@ func (h *WebSocketHandler) handleMessage(socket *gws.Conn, pkt *protocol.Packet)
 	case message.OP_PRIVATE:
 		h.handlePrivate(socket, msg, client, pkt.Header.SequenceID)
 	default:
-		slog.Info("🔍 未知的操作类型", "operation", pkt.Header.Operation)
+		slog.Error("unknown operation", "operation", pkt.Header.Operation)
 	}
 }
 
@@ -315,7 +313,7 @@ func (h *WebSocketHandler) handleRegister(socket *gws.Conn, msg message.Message,
 		Message: "注册成功",
 	}
 
-	h.sendMessage(socket, response, message.OP_REGISTER_REPLY, sequenceID)
+	h.sendMessage(socket, response, message.OP_REGISTER_REPLY)
 
 	// 广播新客户端上线
 	onlineMsg := &message.ClientOnlineMessage{
@@ -328,10 +326,10 @@ func (h *WebSocketHandler) handleRegister(socket *gws.Conn, msg message.Message,
 		},
 	}
 
-	h.broadcastMessage(onlineMsg, message.OP_CLIENT_ONLINE, sequenceID)
+	h.broadcastMessage(onlineMsg, message.OP_CLIENT_ONLINE)
 
 	// 发送当前客户端列表
-	h.sendClientList(socket, sequenceID)
+	h.sendClientList(socket)
 }
 
 // handleBroadcast 处理广播消息
@@ -355,7 +353,7 @@ func (h *WebSocketHandler) handleBroadcast(socket *gws.Conn, msg message.Message
 		},
 	}
 
-	h.broadcastMessage(response, message.OP_BROADCAST, sequenceID)
+	h.broadcastMessage(response, message.OP_BROADCAST)
 }
 
 // handlePrivate 处理私聊消息
@@ -395,48 +393,44 @@ func (h *WebSocketHandler) handlePrivate(socket *gws.Conn, msg message.Message, 
 	}
 
 	if targetSession != nil {
-		h.sendMessage(targetSession, response, message.OP_PRIVATE, sequenceID)
+		h.sendMessage(targetSession, response, message.OP_PRIVATE)
 	} else {
 		// 目标不存在，发送错误消息
 		errorMsg := &message.ErrorMessage{
 			BaseMessage: message.BaseMessage{},
 			Error:       "目标客户端 " + targetID + " 不存在或未在线",
 		}
-		h.sendMessage(socket, errorMsg, message.OP_ERROR, sequenceID)
+		h.sendMessage(socket, errorMsg, message.OP_ERROR)
 	}
 }
 
 // sendMessage 发送消息
-func (h *WebSocketHandler) sendMessage(socket *gws.Conn, msg message.Message, operation uint16, sequenceID uint32) {
+func (h *WebSocketHandler) sendMessage(socket *gws.Conn, msg message.Message, operation uint16) error {
 	body, err := msg.Marshal()
 	if err != nil {
-		slog.Error("❌ 序列化消息失败", "error", err)
-		return
+		return fmt.Errorf("failed to marshal: %w", err)
 	}
 
-	pkt := protocol.NewPacket(operation, body, protocol.WithSequenceID(sequenceID))
+	pkt := protocol.NewPacket(operation, body)
 	data, err := protocol.Pack(pkt)
 	if err != nil {
-		slog.Error("❌ 打包消息失败", "error", err)
-		return
+		return fmt.Errorf("failed to pack: %w", err)
 	}
 
-	_ = socket.WriteMessage(gws.OpcodeBinary, data)
+	return socket.WriteMessage(gws.OpcodeBinary, data)
 }
 
 // broadcastMessage 广播消息
-func (h *WebSocketHandler) broadcastMessage(msg message.Message, operation uint16, sequenceID uint32) {
+func (h *WebSocketHandler) broadcastMessage(msg message.Message, operation uint16) error {
 	body, err := msg.Marshal()
 	if err != nil {
-		slog.Error("❌ 序列化广播消息失败", "error", err)
-		return
+		return fmt.Errorf("failed to marshal: %w", err)
 	}
 
-	pkt := protocol.NewPacket(operation, body, protocol.WithSequenceID(sequenceID))
+	pkt := protocol.NewPacket(operation, body)
 	data, err := protocol.Pack(pkt)
 	if err != nil {
-		slog.Error("❌ 打包广播消息失败", "error", err)
-		return
+		return fmt.Errorf("failed to pack: %w", err)
 	}
 
 	// 先复制客户端列表，避免长时间持有锁
@@ -450,10 +444,12 @@ func (h *WebSocketHandler) broadcastMessage(msg message.Message, operation uint1
 	for _, session := range sessions {
 		_ = session.WriteMessage(gws.OpcodeBinary, data)
 	}
+
+	return nil
 }
 
 // sendClientList 发送客户端列表
-func (h *WebSocketHandler) sendClientList(socket *gws.Conn, sequenceID uint32) {
+func (h *WebSocketHandler) sendClientList(socket *gws.Conn) {
 	h.clientsLock.RLock()
 	var clientList []message.ClientInfo
 	for _, client := range h.clients {
@@ -470,5 +466,5 @@ func (h *WebSocketHandler) sendClientList(socket *gws.Conn, sequenceID uint32) {
 		Clients:     clientList,
 	}
 
-	h.sendMessage(socket, listMsg, message.OP_CLIENT_LIST, sequenceID)
+	h.sendMessage(socket, listMsg, message.OP_CLIENT_LIST)
 }

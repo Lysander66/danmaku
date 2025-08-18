@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -129,6 +130,26 @@ func (c *Client) connect() error {
 	return nil
 }
 
+// sendMessage 通用消息发送方法
+func (c *Client) sendMessage(operation uint16, msg message.Message) error {
+	if c.conn == nil || !c.isConnected {
+		return fmt.Errorf("未连接到服务器")
+	}
+
+	body, err := msg.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal: %w", err)
+	}
+
+	pkt := protocol.NewPacket(operation, body)
+	data, err := protocol.Pack(pkt)
+	if err != nil {
+		return fmt.Errorf("failed to pack: %w", err)
+	}
+
+	return c.conn.WriteMessage(gws.OpcodeBinary, data)
+}
+
 func (c *Client) register() {
 	if c.conn == nil {
 		slog.Error("❌ 无法注册", "reason", "连接未建立")
@@ -144,38 +165,32 @@ func (c *Client) register() {
 		},
 	}
 
-	body, err := registerMsg.Marshal()
-	if err != nil {
-		slog.Error("❌ 序列化注册消息失败", "error", err)
+	if err := c.sendMessage(message.OP_REGISTER, registerMsg); err != nil {
+		slog.Error("❌ 注册失败", "error", err)
 		return
 	}
-
-	pkt := protocol.NewPacket(message.OP_REGISTER, body)
-	data, err := protocol.Pack(pkt)
-	if err != nil {
-		slog.Error("❌ 打包注册消息失败", "error", err)
-		return
-	}
-
-	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
 }
 
 // handleMessage 处理协议消息
-func (c *Client) handleMessage(pkt *protocol.Packet) {
-	// 创建对应的消息对象
+func (c *Client) handleMessage(data []byte) {
+	pkt, err := protocol.Unpack(data)
+	if err != nil {
+		slog.Error("failed to unpack", "error", err)
+		return
+	}
+
+	// 创建对应的消息
 	msg := message.NewMessage(pkt.Header.Operation)
 	if msg == nil {
-		slog.Error("❌ 未知的操作类型", "operation", pkt.Header.Operation)
+		slog.Error("unknown operation", "operation", pkt.Header.Operation)
 		return
 	}
 
-	// 解析消息体
-	if err := msg.Unmarshal(pkt.Payload); err != nil {
-		slog.Error("❌ 解析消息体失败", "error", err)
+	if err = msg.Unmarshal(pkt.Payload); err != nil {
+		slog.Error("failed to unmarshal", "error", err)
 		return
 	}
 
-	// 根据操作类型处理消息
 	switch pkt.Header.Operation {
 	case message.OP_REGISTER_REPLY:
 		c.handleRegisterReply(msg)
@@ -192,7 +207,7 @@ func (c *Client) handleMessage(pkt *protocol.Packet) {
 	case message.OP_ERROR:
 		c.handleError(msg)
 	default:
-		slog.Info("🔍 未知的操作类型", "operation", pkt.Header.Operation)
+		slog.Error("unknown operation", "operation", pkt.Header.Operation)
 	}
 }
 
@@ -355,41 +370,22 @@ func (c *Client) HandleUserInput() {
 
 // sendBroadcast 发送广播消息
 func (c *Client) sendBroadcast(content any) {
-	if c.conn == nil || !c.isConnected {
-		slog.Error("❌ 未连接到服务器")
-		return
-	}
-
 	broadcastMsg := &message.BroadcastMessage{
 		BaseMessage: message.BaseMessage{
 			Content: content,
 		},
 	}
 
-	body, err := broadcastMsg.Marshal()
-	if err != nil {
-		slog.Error("❌ 序列化广播消息失败", "error", err)
+	if err := c.sendMessage(message.OP_BROADCAST, broadcastMsg); err != nil {
+		slog.Error("❌ 发送广播消息失败", "error", err)
 		return
 	}
 
-	pkt := protocol.NewPacket(message.OP_BROADCAST, body)
-	data, err := protocol.Pack(pkt)
-	if err != nil {
-		slog.Error("❌ 打包广播消息失败", "error", err)
-		return
-	}
-
-	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
 	slog.Info("📻 广播消息已发送", "content", content)
 }
 
 // sendPrivate 发送私聊消息
 func (c *Client) sendPrivate(target string, content any) {
-	if c.conn == nil || !c.isConnected {
-		slog.Error("❌ 未连接到服务器")
-		return
-	}
-
 	privateMsg := &message.PrivateMessage{
 		BaseMessage: message.BaseMessage{
 			Target:  target,
@@ -397,20 +393,11 @@ func (c *Client) sendPrivate(target string, content any) {
 		},
 	}
 
-	body, err := privateMsg.Marshal()
-	if err != nil {
-		slog.Error("❌ 序列化私聊消息失败", "error", err)
+	if err := c.sendMessage(message.OP_PRIVATE, privateMsg); err != nil {
+		slog.Error("❌ 发送私聊消息失败", "error", err)
 		return
 	}
 
-	pkt := protocol.NewPacket(message.OP_PRIVATE, body)
-	data, err := protocol.Pack(pkt)
-	if err != nil {
-		slog.Error("❌ 打包私聊消息失败", "error", err)
-		return
-	}
-
-	_ = c.conn.WriteMessage(gws.OpcodeBinary, data)
 	slog.Info("💬 私聊消息已发送", "target", target, "content", content)
 }
 
@@ -510,12 +497,5 @@ func (w *WebSocketClient) OnPong(socket *gws.Conn, payload []byte) {
 func (w *WebSocketClient) OnMessage(socket *gws.Conn, message *gws.Message) {
 	defer message.Close()
 
-	// 解析协议
-	pkt, err := protocol.Unpack(message.Bytes())
-	if err != nil {
-		slog.Error("❌ 解析消息失败", "error", err)
-		return
-	}
-
-	w.client.handleMessage(pkt)
+	w.client.handleMessage(message.Bytes())
 }
